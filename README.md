@@ -220,7 +220,7 @@ net-study/
 ├── dashboard/                     # backend Sinatra + SPA Vue
 │   ├── app.rb                     #   /events (ingest), /stream (SSE), /ca/sign (proxy step-ca),
 │   │                              #   /trigger, /probe-from/:node, /api/authorization, ...
-│   ├── probe.rb
+│   ├── probe.rbs
 │   ├── Dockerfile                 #   multistage: builda o Vue, depois serve via Sinatra
 │   └── web/                       #   SPA em Vue 3 (Composition API, Vite, Reka UI)
 │       └── src/
