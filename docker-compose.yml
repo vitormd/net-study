@@ -1,0 +1,184 @@
+# net-study fase 1: dois serviços Ruby conversando via mTLS sobre IPv6,
+# mais um dashboard que visualiza o handshake em tempo real.
+#
+# Rede:
+#   - lab6 com IPv6 habilitado, ULA fd00:dead:beef::/64.
+#   - cada serviço com IPv6 fixo, pra que os certs (SAN) sejam estáveis.
+#
+# Plano de dados (mTLS, a "lição"):
+#   client  --(HTTPS mTLS sobre IPv6)-->  api
+#
+# Plano de controle (HTTP simples, telemetria):
+#   client/api  --(POST /events)--> dashboard
+#   browser     --(SSE /stream)---> dashboard
+#   dashboard   --(POST /trigger)-> client
+
+networks:
+  lab6:
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: fd00:dead:beef::/64
+
+volumes:
+  step-ca-data:    # tudo da PKI: root CA, intermediate, configs, db
+  test-certs:      # fixtures wrong-ca/expired gerados pela init container
+
+services:
+  # ------------------------------------------------------------------------
+  # PKI online — substitui o openssl/gen-certs.sh por uma CA real.
+  # Auto-inicializa na primeira subida usando as env DOCKER_STEPCA_INIT_*.
+  # ------------------------------------------------------------------------
+  # Orçamento de recursos (cabe em 1 vCPU + 500MB):
+  #   step-ca 64 · api-gateway 32 · api 88 · client 88 · dashboard 104 · sniffer 96
+  #   = ~472MB em regime. test-certs-init (64MB) roda antes dos apps Ruby.
+  step-ca:
+    image: smallstep/step-ca:latest
+    container_name: net-study-step-ca
+    mem_limit: 64m
+    mem_reservation: 40m
+    cpus: 0.40
+    networks:
+      lab6:
+        ipv6_address: fd00:dead:beef::10
+        aliases: [step-ca]
+    volumes:
+      - step-ca-data:/home/step
+    environment:
+      DOCKER_STEPCA_INIT_NAME: net-study
+      DOCKER_STEPCA_INIT_DNS_NAMES: step-ca,localhost
+      DOCKER_STEPCA_INIT_PROVISIONER_NAME: admin
+      DOCKER_STEPCA_INIT_PASSWORD: changeme-lab
+      DOCKER_STEPCA_INIT_REMOTE_MANAGEMENT: "true"
+      DOCKER_STEPCA_INIT_ADDRESS: ":9000"
+    healthcheck:
+      test: ["CMD", "step", "ca", "health", "--ca-url", "https://localhost:9000", "--root", "/home/step/certs/root_ca.crt"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  # One-shot: gera os fixtures wrong-ca / wrong-client / client-expired no volume
+  # test-certs. Roda só uma vez (skip se já existirem os arquivos).
+  test-certs-init:
+    build: ./test-certs-init
+    container_name: net-study-test-certs-init
+    mem_limit: 64m
+    cpus: 0.50
+    depends_on:
+      step-ca:
+        condition: service_healthy
+    volumes:
+      - step-ca-data:/step-data:ro
+      - test-certs:/certs
+    environment:
+      CA_PASSWORD: changeme-lab
+    restart: "no"
+
+
+  # api-gateway: nginx terminando mTLS na frente DA api e proxying HTTP puro
+  # com header XFCC. Padrão usado por nginx-ingress, AWS ALB, Envoy.
+  api-gateway:
+    build: ./api-gateway
+    container_name: net-study-api-gateway
+    mem_limit: 32m
+    mem_reservation: 16m
+    cpus: 0.30
+    networks:
+      lab6:
+        ipv6_address: fd00:dead:beef::25
+        aliases:
+          - api-gateway
+          - gateway       # alias retrocompatível
+          - evil-api      # cenário "wrong-host" — não está no SAN do cert
+    volumes:
+      - step-ca-data:/step-data:ro
+    environment:
+      CA_PASSWORD: changeme-lab
+    depends_on:
+      step-ca:
+        condition: service_healthy
+
+  api:
+    build: ./api
+    container_name: net-study-api
+    mem_limit: 88m
+    mem_reservation: 56m
+    cpus: 0.50
+    networks:
+      lab6:
+        ipv6_address: fd00:dead:beef::20
+        aliases:
+          - api
+    environment:
+      DASHBOARD_URL: http://[fd00:dead:beef::30]
+      SERVICE_NAME: api
+
+  client:
+    build: ./client
+    container_name: net-study-client
+    mem_limit: 88m
+    mem_reservation: 56m
+    cpus: 0.50
+    networks:
+      lab6:
+        ipv6_address: fd00:dead:beef::21
+    volumes:
+      - step-ca-data:/step-data:ro
+      - test-certs:/certs:ro
+    environment:
+      API_URL: https://[fd00:dead:beef::25]:8443   # aponta pro api-gateway, não pra api direto
+      DASHBOARD_URL: http://[fd00:dead:beef::30]
+      SERVICE_NAME: client
+      CA_PASSWORD: changeme-lab
+    depends_on:
+      step-ca:
+        condition: service_healthy
+      test-certs-init:
+        condition: service_completed_successfully
+      api:
+        condition: service_started
+
+  dashboard:
+    build: ./dashboard
+    container_name: net-study-dashboard
+    mem_limit: 104m
+    mem_reservation: 64m
+    cpus: 0.50
+    networks:
+      lab6:
+        ipv6_address: fd00:dead:beef::30
+    volumes:
+      - step-ca-data:/step-data:ro
+      - test-certs:/certs:ro
+    environment:
+      CLIENT_URL: http://[fd00:dead:beef::21]:4000
+      SERVICE_NAME: dashboard
+      CA_PASSWORD: changeme-lab
+    depends_on:
+      step-ca:
+        condition: service_healthy
+      test-certs-init:
+        condition: service_completed_successfully
+    ports:
+      - "8080:80"   # abra http://localhost:8080 no navegador
+
+  sniffer:
+    build: ./sniffer
+    container_name: net-study-sniffer
+    mem_limit: 96m
+    mem_reservation: 56m
+    cpus: 0.40
+    # network_mode: host -> entra na namespace da VM do Docker, onde vivem as
+    # bridges. tcpdump em qualquer bridge vê o tráfego de todos os containers.
+    # Filtro exclui o dashboard (porta 80 nem entra no filtro) e foca em 8443
+    # (mTLS interno) e 443 (probes externos).
+    network_mode: host
+    privileged: true
+    depends_on: [api, dashboard]
+    restart: unless-stopped
+    environment:
+      DASHBOARD_URL: http://[fd00:dead:beef::30]
+      # FILTER e IFACE auto-descobertos no startup. FILTER pode ser sobrescrito
+      # via env. IFACE também (env IFACE=br-XXX).
+      IFACE: auto
